@@ -31,6 +31,8 @@ SECTION_SPACING_STYLES = (
     SECTION_SPACING_ADAPTIVE,
     SECTION_SPACING_UNIFORM,
 )
+LAYOUT_RADIAL = "radial"
+LAYOUT_LINEAR = "linear"
 
 
 def opposed_join_order(quantity: int) -> List[int]:
@@ -65,6 +67,7 @@ class ManifoldInputs:
     section_count: int = 17
     section_spacing: str = SECTION_SPACING_ADAPTIVE
     integration_samples: int = 360
+    linear_layout: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,20 @@ class ResolvedInputs:
     section_count: int
     section_spacing: str
     integration_samples: int
+    linear_layout: bool
+    inlet_positions_mm: Tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class BranchProfile:
+    """One horizontal branch section in layout-independent coordinates."""
+
+    center_x_mm: float
+    center_y_mm: float
+    radius_mm: float
+    ellipse_aspect: float
+    orientation_rad: float
+    local_angle_deg: float
 
 
 @dataclass(frozen=True)
@@ -98,6 +115,34 @@ class Section:
     local_angle_deg: float
     target_area_mm2: float
     calculated_area_mm2: float
+    branch_profiles: Tuple[BranchProfile, ...] = ()
+
+
+def linear_inlet_positions(spacing_mm: float, quantity: int) -> Tuple[float, ...]:
+    """Return centre positions ordered from the middle out on alternating sides.
+
+    The requested spacing is the pitch between every adjacent pair. Even
+    quantities straddle the axis at ``+S/2, -S/2`` and continue with odd
+    half-steps. Odd quantities reserve the origin and continue at whole steps.
+    """
+
+    if spacing_mm <= 0.0:
+        raise ValueError("Linear inlet spacing must be greater than zero.")
+    if quantity < 1:
+        raise ValueError("Linear inlet quantity must be at least one.")
+    positions: List[float] = [0.0] if quantity % 2 else []
+    level = 1
+    while len(positions) < quantity:
+        offset = (
+            level * spacing_mm
+            if quantity % 2
+            else (level - 0.5) * spacing_mm
+        )
+        positions.append(offset)
+        if len(positions) < quantity:
+            positions.append(-offset)
+        level += 1
+    return tuple(positions)
 
 
 def _contact_center_for_slope(
@@ -289,6 +334,108 @@ def _find_advanced_contact(
     return contact_z, contact_center
 
 
+def _linear_contact_center_for_slope(
+    inlet_radius: float,
+    inlet_positions: Tuple[float, ...],
+    outer_offset: float,
+    outer_slope: float,
+) -> float:
+    """Master-centre value at the first tangent pair in a line layout."""
+
+    ratios = tuple(position / outer_offset for position in inlet_positions)
+    ordered = sorted(ratios)
+    required_centers: List[float] = []
+    for left, right in zip(ordered, ordered[1:]):
+        separation_ratio = right - left
+        left_aspect = math.sqrt(1.0 + (left * outer_slope) ** 2)
+        right_aspect = math.sqrt(1.0 + (right * outer_slope) ** 2)
+        required_centers.append(
+            inlet_radius * (left_aspect + right_aspect) / separation_ratio
+        )
+    return max(required_centers)
+
+
+def _linear_clearance(
+    master_center: float,
+    master_slope: float,
+    inlet_radius: float,
+    inlet_positions: Tuple[float, ...],
+    outer_offset: float,
+) -> float:
+    """Minimum horizontal gap between adjacent line-layout ellipses."""
+
+    ratios = sorted(position / outer_offset for position in inlet_positions)
+    clearances = []
+    for left, right in zip(ratios, ratios[1:]):
+        left_aspect = math.sqrt(1.0 + (left * master_slope) ** 2)
+        right_aspect = math.sqrt(1.0 + (right * master_slope) ** 2)
+        gap = master_center * (right - left)
+        clearances.append(gap - inlet_radius * (left_aspect + right_aspect))
+    return min(clearances)
+
+
+def _find_linear_advanced_contact(
+    height_mm: float,
+    outer_offset: float,
+    inlet_radius: float,
+    inlet_positions: Tuple[float, ...],
+    curve_style: str,
+    inlet_weight: float,
+    outlet_weight: float,
+    bend_height_mm: float,
+) -> Tuple[float, float]:
+    """Find first contact descending along advanced straight-line paths."""
+
+    def clearance(z_mm: float) -> Tuple[float, float]:
+        center, slope = _advanced_centerline(
+            z_mm,
+            height_mm,
+            outer_offset,
+            curve_style,
+            inlet_weight,
+            outlet_weight,
+            bend_height_mm,
+        )
+        return (
+            _linear_clearance(
+                center,
+                slope,
+                inlet_radius,
+                inlet_positions,
+                outer_offset,
+            ),
+            center,
+        )
+
+    upper_z = height_mm
+    upper_clearance, _ = clearance(upper_z)
+    if upper_clearance <= 0.0:
+        raise ValueError(
+            "The straight-line inlet tubes touch or overlap at the starting "
+            "plane. Increase input spacing or reduce input diameter."
+        )
+    lower_z = 0.0
+    for index in range(1, 1001):
+        candidate_z = height_mm * (1.0 - index / 1000.0)
+        candidate_clearance, _ = clearance(candidate_z)
+        if candidate_clearance <= 0.0:
+            lower_z = candidate_z
+            break
+        upper_z = candidate_z
+    else:
+        raise RuntimeError("Could not locate the straight-line inlet contact plane.")
+    for _ in range(64):
+        middle_z = 0.5 * (lower_z + upper_z)
+        middle_clearance, _ = clearance(middle_z)
+        if middle_clearance <= 0.0:
+            lower_z = middle_z
+        else:
+            upper_z = middle_z
+    contact_z = 0.5 * (lower_z + upper_z)
+    _, contact_center = clearance(contact_z)
+    return contact_z, contact_center
+
+
 def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
     """Validate inputs and resolve the height/angle alternative.
 
@@ -308,6 +455,11 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
         errors.append("Input tube quantity must be between 2 and 24.")
     if values.section_count < 7 or values.section_count > 61:
         errors.append("Section count must be between 7 and 61.")
+    if values.linear_layout and values.section_count < 9:
+        errors.append(
+            "Straight-line layouts require at least 9 sections so the unified "
+            "core and separate inlets both retain stable loft spans."
+        )
     if values.section_spacing not in SECTION_SPACING_STYLES:
         errors.append("Section spacing must be either adaptive or uniform.")
     if values.integration_samples < 90:
@@ -334,6 +486,28 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
     height = values.height_mm
     angle = values.inlet_angle_deg
     inlet_radius = 0.5 * values.input_diameter_mm
+    inlet_positions = (
+        linear_inlet_positions(values.spacing_mm, values.quantity)
+        if values.linear_layout and values.spacing_mm > 0.0 and values.quantity >= 1
+        else ()
+    )
+    outer_offset = (
+        max(abs(position) for position in inlet_positions)
+        if inlet_positions
+        else values.spacing_mm
+    )
+
+    def contact_center_for_slope(candidate_slope: float) -> float:
+        if values.linear_layout:
+            return _linear_contact_center_for_slope(
+                inlet_radius,
+                inlet_positions,
+                outer_offset,
+                candidate_slope,
+            )
+        return _contact_center_for_slope(
+            inlet_radius, values.quantity, candidate_slope
+        )
 
     slope = 0.0
     contact_center = 0.0
@@ -343,20 +517,32 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
             errors.append("Height must be greater than zero.")
         if not errors:
             try:
-                contact_height, contact_center = _find_advanced_contact(
-                    height,
-                    values.spacing_mm,
-                    inlet_radius,
-                    values.quantity,
-                    values.curve_style,
-                    values.inlet_tangency_weight,
-                    values.outlet_tangency_weight,
-                    values.bend_height_mm,
-                )
+                if values.linear_layout:
+                    contact_height, contact_center = _find_linear_advanced_contact(
+                        height,
+                        outer_offset,
+                        inlet_radius,
+                        inlet_positions,
+                        values.curve_style,
+                        values.inlet_tangency_weight,
+                        values.outlet_tangency_weight,
+                        values.bend_height_mm,
+                    )
+                else:
+                    contact_height, contact_center = _find_advanced_contact(
+                        height,
+                        values.spacing_mm,
+                        inlet_radius,
+                        values.quantity,
+                        values.curve_style,
+                        values.inlet_tangency_weight,
+                        values.outlet_tangency_weight,
+                        values.bend_height_mm,
+                    )
                 _, inlet_slope = _advanced_centerline(
                     height,
                     height,
-                    values.spacing_mm,
+                    outer_offset,
                     values.curve_style,
                     values.inlet_tangency_weight,
                     values.outlet_tangency_weight,
@@ -377,10 +563,8 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
             def height_equation(candidate: float) -> float:
                 return (
                     candidate * height
-                    - values.spacing_mm
-                    - _contact_center_for_slope(
-                        inlet_radius, values.quantity, candidate
-                    )
+                    - outer_offset
+                    - contact_center_for_slope(candidate)
                 )
 
             while height_equation(high) <= 0.0 and high < 1e6:
@@ -399,20 +583,16 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
                         high = middle
                 slope = 0.5 * (low + high)
                 angle = math.degrees(math.atan(slope))
-                contact_center = _contact_center_for_slope(
-                    inlet_radius, values.quantity, slope
-                )
+                contact_center = contact_center_for_slope(slope)
     else:
         if not 0.0 < angle < 90.0:
             errors.append("Input tube angle must be greater than 0 and less than 90 degrees.")
         elif values.spacing_mm > 0 and inlet_radius > 0 and values.quantity >= 2:
             slope = math.tan(math.radians(angle))
-            contact_center = _contact_center_for_slope(
-                inlet_radius, values.quantity, slope
-            )
-            height = (values.spacing_mm + contact_center) / slope
+            contact_center = contact_center_for_slope(slope)
+            height = (outer_offset + contact_center) / slope
 
-    if not values.vertical_inlets and contact_center >= values.spacing_mm and not errors:
+    if not values.vertical_inlets and contact_center >= outer_offset and not errors:
         errors.append(
             "The inlet tubes touch or overlap at the starting plane. Increase input "
             "spacing, reduce input diameter, or reduce the inlet angle."
@@ -442,6 +622,8 @@ def resolve_inputs(values: ManifoldInputs) -> ResolvedInputs:
         section_count=values.section_count,
         section_spacing=values.section_spacing,
         integration_samples=values.integration_samples,
+        linear_layout=values.linear_layout,
+        inlet_positions_mm=inlet_positions,
     )
 
 
@@ -456,10 +638,15 @@ def evaluate_centerline(
     """Return centre radius and radial slope at an arbitrary height."""
 
     if resolved.vertical_inlets:
+        outer_offset = (
+            max(abs(position) for position in resolved.inlet_positions_mm)
+            if resolved.linear_layout
+            else resolved.spacing_mm
+        )
         return _advanced_centerline(
             z_mm,
             resolved.height_mm,
-            resolved.spacing_mm,
+            outer_offset,
             resolved.curve_style,
             resolved.inlet_tangency_weight,
             resolved.outlet_tangency_weight,
@@ -478,6 +665,25 @@ def evaluate_centerline(
         resolved.contact_center_radius_mm
         + straight_slope * (z_mm - resolved.contact_height_mm),
         straight_slope,
+    )
+
+
+def evaluate_branch_center(
+    resolved: ResolvedInputs, z_mm: float, branch_index: int
+) -> Tuple[float, float, float, float]:
+    """Return ``x, y, dx/dz, dy/dz`` for one branch centreline."""
+
+    master_center, master_slope = evaluate_centerline(resolved, z_mm)
+    if resolved.linear_layout:
+        outer_offset = max(abs(position) for position in resolved.inlet_positions_mm)
+        ratio = resolved.inlet_positions_mm[branch_index] / outer_offset
+        return ratio * master_center, 0.0, ratio * master_slope, 0.0
+    phi = 2.0 * math.pi * branch_index / resolved.quantity
+    return (
+        master_center * math.cos(phi),
+        master_center * math.sin(phi),
+        master_slope * math.cos(phi),
+        master_slope * math.sin(phi),
     )
 
 
@@ -511,6 +717,24 @@ def sample_centerline(
     final_center, _ = evaluate_centerline(resolved, final_z)
     samples.append((final_z, final_center))
     return samples
+
+
+def sample_branch_centerline(
+    resolved: ResolvedInputs,
+    sections: List[Section],
+    branch_index: int,
+    subdivisions_per_span: int,
+) -> List[Tuple[float, float, float]]:
+    """Densely sample one physical branch as ``(z, x, y)`` points."""
+
+    if branch_index < 0 or branch_index >= resolved.quantity:
+        raise ValueError("Branch index is outside the inlet quantity.")
+    radial_samples = sample_centerline(resolved, sections, subdivisions_per_span)
+    points = []
+    for z_mm, _ in radial_samples:
+        x_mm, y_mm, _, _ = evaluate_branch_center(resolved, z_mm, branch_index)
+        points.append((z_mm, x_mm, y_mm))
+    return points
 
 
 def ellipse_union_area(
@@ -587,6 +811,114 @@ def ellipse_union_area(
     return integral * quantity
 
 
+def linear_ellipse_union_area(
+    centers_mm: Tuple[float, ...],
+    branch_radius_mm: float,
+    aspects: Tuple[float, ...],
+) -> float:
+    """Exact union area of axis-aligned ellipses centred on one line.
+
+    At each x coordinate all ellipses contribute symmetric vertical intervals,
+    so their union is governed by the highest ellipse. Pairwise envelope
+    crossings and support ends split that envelope into analytically integrable
+    ellipse arcs.
+    """
+
+    if branch_radius_mm <= 0.0 or not centers_mm:
+        return 0.0
+    if len(centers_mm) != len(aspects) or any(aspect <= 0.0 for aspect in aspects):
+        raise ValueError("Linear ellipse centres and aspects must be valid and aligned.")
+
+    radius = branch_radius_mm
+    semi_majors = tuple(radius * aspect for aspect in aspects)
+    breakpoints: List[float] = []
+    for center, semi_major in zip(centers_mm, semi_majors):
+        breakpoints.extend((center - semi_major, center + semi_major))
+    for left_index in range(len(centers_mm)):
+        for right_index in range(left_index + 1, len(centers_mm)):
+            ci = centers_mm[left_index]
+            cj = centers_mm[right_index]
+            ai = semi_majors[left_index]
+            aj = semi_majors[right_index]
+            candidates = [(ai * cj + aj * ci) / (ai + aj)]
+            if abs(ai - aj) > 1e-12:
+                candidates.append((ai * cj - aj * ci) / (ai - aj))
+            for candidate in candidates:
+                if (
+                    ci - ai - 1e-12 <= candidate <= ci + ai + 1e-12
+                    and cj - aj - 1e-12 <= candidate <= cj + aj + 1e-12
+                ):
+                    breakpoints.append(candidate)
+
+    ordered = sorted(breakpoints)
+    unique = [ordered[0]]
+    for value in ordered[1:]:
+        if value - unique[-1] > 1e-10:
+            unique.append(value)
+
+    def arc_antiderivative(x_mm: float, center: float, semi_major: float) -> float:
+        u = max(-1.0, min(1.0, (x_mm - center) / semi_major))
+        return radius * semi_major * (
+            u * math.sqrt(max(0.0, 1.0 - u * u)) + math.asin(u)
+        )
+
+    area = 0.0
+    for start, end in zip(unique, unique[1:]):
+        if end - start <= 1e-12:
+            continue
+        middle = 0.5 * (start + end)
+        best_index = -1
+        best_height_squared = -1.0
+        for index, (center, semi_major) in enumerate(
+            zip(centers_mm, semi_majors)
+        ):
+            u = (middle - center) / semi_major
+            height_squared = radius * radius * (1.0 - u * u)
+            if height_squared > best_height_squared and height_squared >= -1e-12:
+                best_height_squared = height_squared
+                best_index = index
+        if best_index >= 0:
+            area += arc_antiderivative(
+                end, centers_mm[best_index], semi_majors[best_index]
+            ) - arc_antiderivative(
+                start, centers_mm[best_index], semi_majors[best_index]
+            )
+    return area
+
+
+def solve_linear_branch_radius(
+    target_area: float,
+    centers_mm: Tuple[float, ...],
+    aspects: Tuple[float, ...],
+    hint_radius: float,
+) -> Tuple[float, float]:
+    """Solve the shared minor radius for a straight-line ellipse union."""
+
+    if target_area <= 0.0:
+        raise ValueError("Target area must be greater than zero.")
+    low = 0.0
+    high = max(hint_radius, math.sqrt(target_area / math.pi), 1e-6)
+    high_area = linear_ellipse_union_area(centers_mm, high, aspects)
+    for _ in range(32):
+        if high_area >= target_area:
+            break
+        high *= 2.0
+        high_area = linear_ellipse_union_area(centers_mm, high, aspects)
+    else:
+        raise RuntimeError("Could not bracket the straight-line branch radius.")
+    radius = high
+    area = high_area
+    for _ in range(52):
+        radius = 0.5 * (low + high)
+        area = linear_ellipse_union_area(centers_mm, radius, aspects)
+        if area < target_area:
+            low = radius
+        else:
+            high = radius
+    radius = 0.5 * (low + high)
+    return radius, linear_ellipse_union_area(centers_mm, radius, aspects)
+
+
 def ellipse_union_outer_radius(
     center_radius: float,
     branch_radius: float,
@@ -619,6 +951,38 @@ def ellipse_union_outer_radius(
     return outer
 
 
+def branch_profiles_outer_radius(
+    profiles: Tuple[BranchProfile, ...], theta: float
+) -> float:
+    """Return the furthest ray hit for arbitrary oriented branch ellipses."""
+
+    ray_x = math.cos(theta)
+    ray_y = math.sin(theta)
+    outer = 0.0
+    for profile in profiles:
+        a = profile.radius_mm * profile.ellipse_aspect
+        b = profile.radius_mm
+        cos_o = math.cos(profile.orientation_rad)
+        sin_o = math.sin(profile.orientation_rad)
+        local_dx = ray_x * cos_o + ray_y * sin_o
+        local_dy = -ray_x * sin_o + ray_y * cos_o
+        local_cx = profile.center_x_mm * cos_o + profile.center_y_mm * sin_o
+        local_cy = -profile.center_x_mm * sin_o + profile.center_y_mm * cos_o
+        inv_a2 = 1.0 / (a * a)
+        inv_b2 = 1.0 / (b * b)
+        qa = local_dx * local_dx * inv_a2 + local_dy * local_dy * inv_b2
+        qb = -2.0 * (
+            local_dx * local_cx * inv_a2 + local_dy * local_cy * inv_b2
+        )
+        qc = local_cx * local_cx * inv_a2 + local_cy * local_cy * inv_b2 - 1.0
+        discriminant = qb * qb - 4.0 * qa * qc
+        if discriminant < 0.0:
+            continue
+        hi = (-qb + math.sqrt(max(0.0, discriminant))) / (2.0 * qa)
+        outer = max(outer, hi)
+    return outer
+
+
 def unified_clover_boundary(
     section: Section, quantity: int, point_count: int = 96
 ) -> List[Tuple[float, float]]:
@@ -636,13 +1000,16 @@ def unified_clover_boundary(
     points: List[Tuple[float, float]] = []
     for point_index in range(point_count):
         theta = 2.0 * math.pi * point_index / point_count
-        radius = ellipse_union_outer_radius(
-            section.center_radius_mm,
-            section.branch_radius_mm,
-            section.ellipse_aspect,
-            quantity,
-            theta,
-        )
+        if section.branch_profiles:
+            radius = branch_profiles_outer_radius(section.branch_profiles, theta)
+        else:
+            radius = ellipse_union_outer_radius(
+                section.center_radius_mm,
+                section.branch_radius_mm,
+                section.ellipse_aspect,
+                quantity,
+                theta,
+            )
         points.append((radius * math.cos(theta), radius * math.sin(theta)))
     polygon_area = 0.5 * abs(
         sum(
@@ -666,12 +1033,28 @@ def unified_core_end_index(sections: List[Section]) -> int:
 
     if not sections:
         raise ValueError("At least one section is required for a unified core.")
-    safe_indices = [
-        section.index
-        for section in sections
-        if section.center_radius_mm
-        <= 0.98 * section.branch_radius_mm * section.ellipse_aspect
-    ]
+    safe_indices = []
+    for section in sections:
+        if section.branch_profiles:
+            origin_inside_all = True
+            for profile in section.branch_profiles:
+                cos_o = math.cos(profile.orientation_rad)
+                sin_o = math.sin(profile.orientation_rad)
+                local_x = profile.center_x_mm * cos_o + profile.center_y_mm * sin_o
+                local_y = -profile.center_x_mm * sin_o + profile.center_y_mm * cos_o
+                a = profile.radius_mm * profile.ellipse_aspect
+                b = profile.radius_mm
+                normalized = (local_x / a) ** 2 + (local_y / b) ** 2
+                if normalized > 0.98**2:
+                    origin_inside_all = False
+                    break
+            if origin_inside_all:
+                safe_indices.append(section.index)
+        elif (
+            section.center_radius_mm
+            <= 0.98 * section.branch_radius_mm * section.ellipse_aspect
+        ):
+            safe_indices.append(section.index)
     return max(safe_indices) if safe_indices else 0
 
 
@@ -728,7 +1111,11 @@ def _uniform_section_parameters(resolved: ResolvedInputs) -> List[float]:
     # Reserve at least three intervals on either side of first contact for
     # stable loft interpolation and constant-diameter inlet verification.
     upper_intervals = round(interval_count * (1.0 - contact_t))
-    upper_intervals = max(3, min(interval_count - 3, upper_intervals))
+    minimum_side_intervals = 4 if resolved.linear_layout else 3
+    upper_intervals = max(
+        minimum_side_intervals,
+        min(interval_count - minimum_side_intervals, upper_intervals),
+    )
     lower_intervals = interval_count - upper_intervals
     parameters = [
         contact_t * index / lower_intervals
@@ -830,10 +1217,15 @@ def _adaptive_section_parameters(resolved: ResolvedInputs) -> List[float]:
         for index in range(len(segment_data))
         if unique_anchors[index] >= contact_t - 1e-10
     ]
-    # Preserve the previous stability guarantee of at least three intervals
-    # above and below first contact, even when bend height adds another anchor.
+    # Preserve stable interpolation on both sides of contact. A straight-line
+    # core also reserves three non-outlet profiles below its handoff, so it
+    # needs one additional lower interval for the contact anchor itself.
+    minimum_side_intervals = 4 if resolved.linear_layout else 3
     for group in (lower_segments, upper_segments):
-        while sum(interval_allocations[index] for index in group) < 3:
+        while (
+            sum(interval_allocations[index] for index in group)
+            < minimum_side_intervals
+        ):
             chosen = max(
                 group,
                 key=lambda index: feature_lengths[index]
@@ -875,15 +1267,71 @@ def _adaptive_section_parameters(resolved: ResolvedInputs) -> List[float]:
     return parameters
 
 
+def _linear_safe_core_height(
+    resolved: ResolvedInputs,
+    inlet_radius: float,
+    outlet_radius: float,
+    contact_area: float,
+) -> float:
+    """Find the highest line section whose every ellipse contains the axis."""
+
+    outer_offset = max(abs(position) for position in resolved.inlet_positions_mm)
+    ratios = tuple(position / outer_offset for position in resolved.inlet_positions_mm)
+    bottom_area = math.pi * outlet_radius * outlet_radius
+
+    def is_safe(z_mm: float) -> bool:
+        center, slope = evaluate_centerline(resolved, z_mm)
+        centers = tuple(ratio * center for ratio in ratios)
+        aspects = tuple(
+            math.sqrt(1.0 + (ratio * slope) ** 2) for ratio in ratios
+        )
+        target = bottom_area + (contact_area - bottom_area) * smoothstep(
+            z_mm / resolved.contact_height_mm
+        )
+        radius, _ = solve_linear_branch_radius(
+            target, centers, aspects, outlet_radius
+        )
+        return all(
+            abs(branch_center) <= 0.98 * radius * aspect
+            for branch_center, aspect in zip(centers, aspects)
+        )
+
+    if is_safe(resolved.contact_height_mm):
+        return resolved.contact_height_mm
+    low = 0.0
+    high = resolved.contact_height_mm
+    for _ in range(44):
+        middle = 0.5 * (low + high)
+        if is_safe(middle):
+            low = middle
+        else:
+            high = middle
+    return low
+
+
 def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Section]]:
     resolved = resolve_inputs(values)
     inlet_radius = 0.5 * resolved.input_diameter_mm
     outlet_radius = 0.5 * resolved.output_diameter_mm
     _, contact_slope = evaluate_centerline(resolved, resolved.contact_height_mm)
-    contact_aspect = math.sqrt(1.0 + contact_slope * contact_slope)
-    contact_area = (
-        resolved.quantity * math.pi * inlet_radius * inlet_radius * contact_aspect
-    )
+    if resolved.linear_layout:
+        outer_offset = max(abs(position) for position in resolved.inlet_positions_mm)
+        ratios = tuple(
+            position / outer_offset for position in resolved.inlet_positions_mm
+        )
+        contact_aspects = tuple(
+            math.sqrt(1.0 + (ratio * contact_slope) ** 2) for ratio in ratios
+        )
+        contact_area = sum(
+            math.pi * inlet_radius * inlet_radius * aspect
+            for aspect in contact_aspects
+        )
+    else:
+        ratios = ()
+        contact_aspect = math.sqrt(1.0 + contact_slope * contact_slope)
+        contact_area = (
+            resolved.quantity * math.pi * inlet_radius * inlet_radius * contact_aspect
+        )
     bottom_area = math.pi * outlet_radius * outlet_radius
     sections: List[Section] = []
     previous_radius = outlet_radius
@@ -892,6 +1340,20 @@ def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Sect
         t_values = _adaptive_section_parameters(resolved)
     else:
         t_values = _uniform_section_parameters(resolved)
+    if resolved.linear_layout:
+        safe_core_height = _linear_safe_core_height(
+            resolved,
+            inlet_radius,
+            outlet_radius,
+            contact_area,
+        )
+        safe_core_t = safe_core_height / resolved.height_mm
+        # Contact is guaranteed to be index 4 or later for line layouts.
+        # Clamp the first three non-outlet sections inside the safe core while
+        # preserving their order, the total section budget, and every later
+        # contact/bend/inlet anchor.
+        for index, fraction in enumerate((0.25, 0.50, 0.75), start=1):
+            t_values[index] = min(t_values[index], fraction * safe_core_t)
 
     for index, t in enumerate(t_values):
         z_mm = resolved.height_mm * t
@@ -901,17 +1363,32 @@ def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Sect
         # without outlet easing may have an angled centreline there, but the
         # final loft section itself is deliberately held circular.
         aspect = 1.0 if index == 0 else math.sqrt(1.0 + slope * slope)
+        if resolved.linear_layout:
+            centers = tuple(ratio * center_radius for ratio in ratios)
+            branch_aspects = tuple(
+                1.0 if index == 0 else math.sqrt(1.0 + (ratio * slope) ** 2)
+                for ratio in ratios
+            )
+        else:
+            centers = ()
+            branch_aspects = ()
         if z_mm >= resolved.contact_height_mm:
             # Before contact, the true cross-section normal to each tube stays
             # circular and constant. In spline mode the horizontal ellipse
             # area varies only because the local centreline angle varies.
-            target = (
-                resolved.quantity
-                * math.pi
-                * inlet_radius
-                * inlet_radius
-                * aspect
-            )
+            if resolved.linear_layout:
+                target = sum(
+                    math.pi * inlet_radius * inlet_radius * branch_aspect
+                    for branch_aspect in branch_aspects
+                )
+            else:
+                target = (
+                    resolved.quantity
+                    * math.pi
+                    * inlet_radius
+                    * inlet_radius
+                    * aspect
+                )
         else:
             merge_fraction = z_mm / resolved.contact_height_mm
             target = bottom_area + (contact_area - bottom_area) * smoothstep(
@@ -924,6 +1401,13 @@ def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Sect
         elif z_mm >= resolved.contact_height_mm - 1e-9:
             radius = inlet_radius
             calculated = target
+        elif resolved.linear_layout:
+            radius, calculated = solve_linear_branch_radius(
+                target,
+                centers,
+                branch_aspects,
+                previous_radius,
+            )
         else:
             radius, calculated = solve_branch_radius(
                 target,
@@ -934,6 +1418,21 @@ def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Sect
                 previous_radius,
             )
         previous_radius = radius
+        profiles: Tuple[BranchProfile, ...] = ()
+        if resolved.linear_layout:
+            profiles = tuple(
+                BranchProfile(
+                    center_x_mm=center,
+                    center_y_mm=0.0,
+                    radius_mm=radius,
+                    ellipse_aspect=branch_aspect,
+                    orientation_rad=0.0,
+                    local_angle_deg=math.degrees(math.atan(ratio * slope)),
+                )
+                for center, branch_aspect, ratio in zip(
+                    centers, branch_aspects, ratios
+                )
+            )
         sections.append(
             Section(
                 index=index,
@@ -945,6 +1444,7 @@ def generate_sections(values: ManifoldInputs) -> Tuple[ResolvedInputs, List[Sect
                 local_angle_deg=local_angle,
                 target_area_mm2=target,
                 calculated_area_mm2=calculated,
+                branch_profiles=profiles,
             )
         )
 

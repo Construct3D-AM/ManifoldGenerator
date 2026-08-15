@@ -35,6 +35,7 @@ ManifoldInputs = _manifold_geometry.ManifoldInputs
 generate_sections = _manifold_geometry.generate_sections
 resolve_inputs = _manifold_geometry.resolve_inputs
 sample_centerline = _manifold_geometry.sample_centerline
+sample_branch_centerline = _manifold_geometry.sample_branch_centerline
 section_area_error = _manifold_geometry.section_area_error
 opposed_join_order = _manifold_geometry.opposed_join_order
 unified_clover_boundary = _manifold_geometry.unified_clover_boundary
@@ -44,7 +45,7 @@ unified_core_end_index = _manifold_geometry.unified_core_end_index
 COMMAND_ID = "SeraphAreaControlledManifoldCommand"
 COMMAND_NAME = "Area-Controlled Manifold"
 COMMAND_DESCRIPTION = (
-    "Create evenly spaced circular inlets that merge smoothly into one circular outlet "
+    "Create radial or straight-line circular inlets that merge smoothly into one circular outlet "
     "while controlling horizontal cross-sectional area."
 )
 PANEL_ID = "SolidScriptsAddinsPanel"
@@ -115,6 +116,7 @@ def _read_values(command_inputs):
         section_count=_input(command_inputs, "sectionCount").value,
         section_spacing=_selected_section_spacing(command_inputs),
         integration_samples=360,
+        linear_layout=_input(command_inputs, "linearLayout").value,
     )
 
 
@@ -149,17 +151,27 @@ def _new_offset_plane(component, z_cm):
     return plane
 
 
-def _add_section_profile(component, plane, section, branch_index, quantity):
+def _add_section_profile(
+    component, plane, section, branch_index, quantity, profile_scale=1.0
+):
     sketch = component.sketches.add(plane)
     sketch.name = "Section {:02d} - Branch {:02d}".format(
         section.index + 1, branch_index + 1
     )
-    phi = 2.0 * math.pi * branch_index / quantity
-    center_cm = section.center_radius_mm / 10.0
-    minor_cm = section.branch_radius_mm / 10.0
-    major_cm = minor_cm * section.ellipse_aspect
-    cx = center_cm * math.cos(phi)
-    cy = center_cm * math.sin(phi)
+    if section.branch_profiles:
+        branch = section.branch_profiles[branch_index]
+        phi = branch.orientation_rad
+        cx = branch.center_x_mm / 10.0
+        cy = branch.center_y_mm / 10.0
+        minor_cm = branch.radius_mm * profile_scale / 10.0
+        major_cm = minor_cm * branch.ellipse_aspect
+    else:
+        phi = 2.0 * math.pi * branch_index / quantity
+        center_cm = section.center_radius_mm / 10.0
+        minor_cm = section.branch_radius_mm * profile_scale / 10.0
+        major_cm = minor_cm * section.ellipse_aspect
+        cx = center_cm * math.cos(phi)
+        cy = center_cm * math.sin(phi)
     center = adsk.core.Point3D.create(cx, cy, 0.0)
 
     if abs(major_cm - minor_cm) < 1e-8:
@@ -186,7 +198,9 @@ def _add_section_profile(component, plane, section, branch_index, quantity):
     return sketch, sketch.profiles.item(0)
 
 
-def _add_unified_clover_profile(component, plane, section, quantity):
+def _add_unified_clover_profile(
+    component, plane, section, quantity, profile_scale=1.0
+):
     """Create one periodic outer-boundary profile for the merged lower core."""
 
     sketch = component.sketches.add(plane)
@@ -195,14 +209,20 @@ def _add_unified_clover_profile(component, plane, section, quantity):
     if section.index == 0:
         center = adsk.core.Point3D.create(0.0, 0.0, 0.0)
         sketch.sketchCurves.sketchCircles.addByCenterRadius(
-            center, section.branch_radius_mm / 10.0
+            center, section.branch_radius_mm * profile_scale / 10.0
         )
     else:
         points = adsk.core.ObjectCollection.create()
         for x_mm, y_mm in unified_clover_boundary(
             section, quantity, point_count
         ):
-            points.add(adsk.core.Point3D.create(x_mm / 10.0, y_mm / 10.0, 0.0))
+            points.add(
+                adsk.core.Point3D.create(
+                    x_mm * profile_scale / 10.0,
+                    y_mm * profile_scale / 10.0,
+                    0.0,
+                )
+            )
         spline = sketch.sketchCurves.sketchFittedSplines.add(points)
         if not spline:
             raise RuntimeError(
@@ -236,17 +256,15 @@ def _add_branch_centerline(
 
     sketch = component.sketches.add(component.xYConstructionPlane)
     sketch.name = "Loft Centreline - Branch {:02d}".format(branch_index + 1)
-    phi = 2.0 * math.pi * branch_index / quantity
-    dense_samples = sample_centerline(
-        resolved, sections, guide_subdivisions
+    dense_samples = sample_branch_centerline(
+        resolved, sections, branch_index, guide_subdivisions
     )
     points = adsk.core.ObjectCollection.create()
-    for z_mm, center_radius_mm in dense_samples:
-        center_cm = center_radius_mm / 10.0
+    for z_mm, x_mm, y_mm in dense_samples:
         points.add(
             adsk.core.Point3D.create(
-                center_cm * math.cos(phi),
-                center_cm * math.sin(phi),
+                x_mm / 10.0,
+                y_mm / 10.0,
                 z_mm / 10.0,
             )
         )
@@ -307,32 +325,69 @@ def _add_unified_core_loft(component, profiles):
 def _add_joined_inlet_loft(
     component, profiles, centerline, branch_index, join_step, total_steps
 ):
-    """Create one inlet loft directly as a Join operation into the core body."""
+    """Join one inlet, with a staged NewBody/Combine fallback for ASM errors."""
 
     loft_features = component.features.loftFeatures
-    loft_input = loft_features.createInput(
-        adsk.fusion.FeatureOperations.JoinFeatureOperation
-    )
-    for profile in profiles:
-        loft_input.loftSections.add(profile)
-    centerline_result = loft_input.centerLineOrRails.addCenterLine(centerline)
-    if not centerline_result:
-        raise RuntimeError(
-            "Fusion rejected the spline centreline for inlet branch {}."
-            .format(branch_index + 1)
-        )
-    loft_input.isSolid = True
-    loft_input.isClosed = False
-    loft_input.isTangentEdgesMerged = True
+
+    def create_input(operation):
+        result = loft_features.createInput(operation)
+        for profile in profiles:
+            result.loftSections.add(profile)
+        if not result.centerLineOrRails.addCenterLine(centerline):
+            raise RuntimeError(
+                "Fusion rejected the spline centreline for inlet branch {}."
+                .format(branch_index + 1)
+            )
+        result.isSolid = True
+        result.isClosed = False
+        result.isTangentEdgesMerged = True
+        return result
+
+    loft_input = create_input(adsk.fusion.FeatureOperations.JoinFeatureOperation)
     try:
         loft = loft_features.add(loft_input)
-    except Exception as error:
-        raise RuntimeError(
-            "Unified-core inlet join {} of {} failed while lofting branch {}. "
-            "The branch begins inside the filled clover overlap region and no "
-            "longer shares the outlet face."
-            .format(join_step, total_steps, branch_index + 1)
-        ) from error
+    except Exception as direct_join_error:
+        try:
+            if component.bRepBodies.count != 1:
+                raise RuntimeError(
+                    "The staged fallback expected one existing manifold body."
+                )
+            target_body = component.bRepBodies.item(0)
+            separate_loft = loft_features.add(
+                create_input(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            )
+            if not separate_loft or separate_loft.bodies.count != 1:
+                raise RuntimeError(
+                    "The staged fallback could not create one inlet tool body."
+                )
+            separate_loft.name = "Fallback Inlet Body {:02d}".format(
+                branch_index + 1
+            )
+            tool_bodies = adsk.core.ObjectCollection.create()
+            tool_bodies.add(separate_loft.bodies.item(0))
+            combine_features = component.features.combineFeatures
+            combine_input = combine_features.createInput(target_body, tool_bodies)
+            combine_input.operation = adsk.fusion.FeatureOperations.JoinFeatureOperation
+            combine_input.isKeepToolBodies = False
+            combine = combine_features.add(combine_input)
+            if not combine or component.bRepBodies.count != 1:
+                raise RuntimeError(
+                    "The staged fallback did not leave one manifold body."
+                )
+            combine.name = "Fallback Joined Inlet {:02d}".format(branch_index + 1)
+            return component.bRepBodies.item(0)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Unified-core inlet join {} of {} failed on branch {}. Both "
+                "the direct Join loft and staged NewBody/Combine fallback were "
+                "rejected by Fusion. Fallback detail: {}"
+                .format(
+                    join_step,
+                    total_steps,
+                    branch_index + 1,
+                    fallback_error,
+                )
+            ) from direct_join_error
     if not loft or loft.bodies.count != 1:
         raise RuntimeError(
             "Unified-core inlet join {} of {} did not leave exactly one result "
@@ -348,7 +403,10 @@ def _build_component(design, resolved, sections, guide_subdivisions):
     try:
         occurrence = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
         component = occurrence.component
-        component.name = "Area Controlled Manifold - {} inlets".format(resolved.quantity)
+        component.name = "Area Controlled {} Manifold - {} inlets".format(
+            "Straight-Line" if resolved.linear_layout else "Radial",
+            resolved.quantity,
+        )
 
         planes = []
         for section in sections:
@@ -374,17 +432,38 @@ def _build_component(design, resolved, sections, guide_subdivisions):
         clover_profiles = []
         clover_point_count = 0
         for section in core_sections:
+            core_profile_scale = 1.0
+            if resolved.linear_layout and section.index >= branch_start_index:
+                overlap_progress = (
+                    (section.index - branch_start_index)
+                    / (core_end_index - branch_start_index)
+                )
+                # Retreat only at the top of the overlap. The inlet profiles
+                # grow from safely internal to exact, forcing a transverse
+                # Boolean intersection instead of nearly coincident faces.
+                core_profile_scale = 1.0 - 0.015 * overlap_progress**3
             sketch, profile, clover_point_count = _add_unified_clover_profile(
                 component,
                 planes[section.index],
                 section,
                 resolved.quantity,
+                core_profile_scale,
             )
             all_sketches.append(sketch)
             clover_profiles.append(profile)
 
         branch_profiles = [[] for _ in range(resolved.quantity)]
         for section in branch_sections:
+            branch_profile_scale = 1.0
+            if resolved.linear_layout and section.index <= core_end_index:
+                overlap_progress = (
+                    (section.index - branch_start_index)
+                    / (core_end_index - branch_start_index)
+                )
+                eased_progress = overlap_progress * overlap_progress * (
+                    3.0 - 2.0 * overlap_progress
+                )
+                branch_profile_scale = 0.96 + 0.04 * eased_progress
             for branch_index in range(resolved.quantity):
                 sketch, profile = _add_section_profile(
                     component,
@@ -392,6 +471,7 @@ def _build_component(design, resolved, sections, guide_subdivisions):
                     section,
                     branch_index,
                     resolved.quantity,
+                    branch_profile_scale,
                 )
                 all_sketches.append(sketch)
                 branch_profiles[branch_index].append(profile)
@@ -411,7 +491,11 @@ def _build_component(design, resolved, sections, guide_subdivisions):
             branch_centerlines.append(guide_curve)
 
         joined_body = _add_unified_core_loft(component, clover_profiles)
-        branch_order = opposed_join_order(resolved.quantity)
+        branch_order = (
+            list(range(resolved.quantity))
+            if resolved.linear_layout
+            else opposed_join_order(resolved.quantity)
+        )
         for join_step, branch_index in enumerate(branch_order, start=1):
             joined_body = _add_joined_inlet_loft(
                 component,
@@ -444,6 +528,8 @@ def _build_component(design, resolved, sections, guide_subdivisions):
             "inputDiameterMm": resolved.input_diameter_mm,
             "inputSpacingMm": resolved.spacing_mm,
             "inputQuantity": resolved.quantity,
+            "layout": "straight-line" if resolved.linear_layout else "radial",
+            "inletPositionsMm": list(resolved.inlet_positions_mm),
             "inputAngleDeg": resolved.inlet_angle_deg,
             "heightMm": resolved.height_mm,
             "contactHeightMm": resolved.contact_height_mm,
@@ -464,7 +550,14 @@ def _build_component(design, resolved, sections, guide_subdivisions):
             "branchOverlapStartSection": branch_start_index + 1,
             "branchOverlapStartHeightMm": sections[branch_start_index].z_mm,
             "cloverBoundaryPointCount": clover_point_count,
-            "joinStrategy": "inlet loft Join operations into one unified lower clover core",
+            "joinStrategy": (
+                "direct inlet Join lofts with automatic staged NewBody/Combine fallback"
+            ),
+            "straightLineOverlapHandoff": (
+                "inlets scale 0.96-to-1.00 while core retreats 1.5% at handoff"
+                if resolved.linear_layout
+                else "not required"
+            ),
             "joinFeatureCount": resolved.quantity,
             "areaInterpretation": "horizontal cross-sectional union area",
         }
@@ -526,6 +619,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             branch_section_count = len(sections) - branch_start_index
             message = (
                 "Created one joined manifold body.\n\n"
+                "Inlet layout: {}\n"
                 "Resolved height: {:.3f} mm\n"
                 "Resolved inlet angle: {:.3f} deg from vertical\n"
                 "Centreline mode: {}\n"
@@ -537,6 +631,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "Joined inlet lofts: {}\n"
                 "Maximum numerical section-area error: {:.4f}%"
             ).format(
+                "straight line" if resolved.linear_layout else "radial circle",
                 resolved.height_mm,
                 resolved.inlet_angle_deg,
                 (
@@ -608,7 +703,8 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             "areaExplanation",
             "",
             "Each isolated inlet stays at the exact input diameter. Use the standard straight "
-            "inlet or an advanced centreline style; area easing begins at first contact.",
+            "inlet or an advanced centreline style; choose radial or straight-line layout. "
+            "Area easing begins at first contact.",
             3,
             True,
         )
@@ -619,12 +715,19 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
         )
         inputs.addValueInput(
             "inputSpacing",
-            "Input tube spacing (centre radius)",
+            "Input spacing / line pitch",
             "mm",
             adsk.core.ValueInput.createByString("35 mm"),
         )
         inputs.addIntegerSpinnerCommandInput(
             "inputQuantity", "Input tube quantity", 2, 24, 1, 4
+        )
+        inputs.addBoolValueInput(
+            "linearLayout",
+            "Straight-line inlet layout",
+            True,
+            "",
+            False,
         )
         inputs.addBoolValueInput(
             "verticalInlets",
