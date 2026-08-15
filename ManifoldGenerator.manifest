@@ -6,7 +6,7 @@
   "description": {
     "": "Creates a smooth, cross-sectional-area-controlled multi-inlet manifold."
   },
-  "version": "2.0.2",
+  "version": "2.0.3",
   "runOnStartup": false,
   "supportedOS": "windows|mac"
 }

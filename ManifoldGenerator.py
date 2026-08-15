@@ -433,7 +433,7 @@ def _build_component(design, resolved, sections, guide_subdivisions):
         clover_point_count = 0
         for section in core_sections:
             core_profile_scale = 1.0
-            if resolved.linear_layout and section.index >= branch_start_index:
+            if section.index >= branch_start_index:
                 overlap_progress = (
                     (section.index - branch_start_index)
                     / (core_end_index - branch_start_index)
@@ -455,7 +455,7 @@ def _build_component(design, resolved, sections, guide_subdivisions):
         branch_profiles = [[] for _ in range(resolved.quantity)]
         for section in branch_sections:
             branch_profile_scale = 1.0
-            if resolved.linear_layout and section.index <= core_end_index:
+            if section.index <= core_end_index:
                 overlap_progress = (
                     (section.index - branch_start_index)
                     / (core_end_index - branch_start_index)
@@ -464,6 +464,12 @@ def _build_component(design, resolved, sections, guide_subdivisions):
                     3.0 - 2.0 * overlap_progress
                 )
                 branch_profile_scale = 0.96 + 0.04 * eased_progress
+            if abs(section.z_mm - resolved.contact_height_mm) < 1e-8:
+                # Exact tangency at a shared loft section is a degenerate
+                # Boolean condition in Fusion. The area transition is allowed
+                # to begin at contact, so add a half-percent construction
+                # overlap there; every section above contact stays exact.
+                branch_profile_scale *= 1.005
             for branch_index in range(resolved.quantity):
                 sketch, profile = _add_section_profile(
                     component,
@@ -553,11 +559,10 @@ def _build_component(design, resolved, sections, guide_subdivisions):
             "joinStrategy": (
                 "direct inlet Join lofts with automatic staged NewBody/Combine fallback"
             ),
-            "straightLineOverlapHandoff": (
+            "overlapHandoff": (
                 "inlets scale 0.96-to-1.00 while core retreats 1.5% at handoff"
-                if resolved.linear_layout
-                else "not required"
             ),
+            "contactReliefScale": 1.005,
             "joinFeatureCount": resolved.quantity,
             "areaInterpretation": "horizontal cross-sectional union area",
         }
