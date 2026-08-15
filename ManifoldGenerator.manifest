@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "719ccce0-327a-4b34-96a9-e7114312a2d0",
+  "author": "Seraph Technologies",
+  "description": {
+    "": "Creates a smooth, cross-sectional-area-controlled multi-inlet manifold."
+  },
+  "version": "1.7.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac"
+}
